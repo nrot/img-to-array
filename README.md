@@ -4,7 +4,7 @@ Simple console app convert image to const value C or Rust array\slice. Support r
 
 From this:
 
-[[/elka.png]]
+![source](elka.png)
 
 To this
 
