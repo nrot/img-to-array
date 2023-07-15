@@ -3,7 +3,7 @@ use image::{imageops::FilterType, DynamicImage};
 use log::{debug, info};
 use std::{fmt::Display, io::Write, path::PathBuf};
 
-#[derive(Debug, Default, Clone, Copy, ValueEnum)]
+#[derive(Debug, Default, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum ColorType {
     /// 3 bytes per pixel
     Rgb8,
@@ -12,6 +12,8 @@ enum ColorType {
     /// 1 bytes per pixel
     #[default]
     Gray8,
+    /// 1 bit per pixel
+    WB1,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -58,6 +60,7 @@ enum OutputPreview {
     #[default]
     Hex,
     Dec,
+    Bin,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
@@ -81,23 +84,26 @@ struct Arg {
     resize: Option<ResizeType>,
     #[arg(long, default_value = "hex")]
     output_view: OutputPreview,
-    #[arg(long, default_value = "IMAGE", help="define protect for C header")]
+    #[arg(long, default_value = "__IMAGE", help = "define protect for C header")]
     protect: Option<String>,
 
-    #[arg(long, default_value = "<cstdint>", help="Include libs for C header")]
+    #[arg(long, default_value = "<cstdint>", help = "Include libs for C header")]
     include_c: Vec<String>,
 
     #[arg(long, default_value = "c")]
     out_lang: OutLang,
 
-    #[arg(long, default_value = "image", help="Name of const variable")]
+    #[arg(long, default_value = "IMAGE", help = "Name of const variable")]
     variable_name: String,
 
-    #[arg(long, default_value = "false", help="Inverse colors")]
+    #[arg(long, default_value = "false", help = "Inverse colors")]
     inverse_color: bool,
 
-    #[arg(long, help="Blur image")]
+    #[arg(long, help = "Blur image")]
     blur: Option<f32>,
+
+    #[arg(long, help = "Black level for wb1 out-color.", default_value = "128")]
+    black_level: u8,
 }
 
 pub struct App {
@@ -127,8 +133,8 @@ impl App {
         if let Some(ni) = self.resize(&image) {
             image = ni;
         }
-        let (step, img_buffer) = match self.args.out_color {
-            ColorType::Rgb8 => (3, image.to_rgb8().into_vec()),
+        let (step, img_buffer, width_del) = match self.args.out_color {
+            ColorType::Rgb8 => (3usize, image.to_rgb8().into_vec(), 1),
             ColorType::Rgb16 => (
                 3 * 2,
                 image
@@ -137,8 +143,28 @@ impl App {
                     .into_iter()
                     .flat_map(|v| v.to_le_bytes())
                     .collect(),
+                1,
             ),
-            ColorType::Gray8 => (1, image.to_luma8().into_vec()),
+            ColorType::Gray8 => (1, image.to_luma8().into_vec(), 1),
+            ColorType::WB1 => (
+                1,
+                image
+                    .to_luma8()
+                    .into_vec()
+                    .chunks(8)
+                    .map(|v| {
+                        let mut re = 0u8;
+                        v.iter().for_each(|b| {
+                            re <<= 1;
+                            if *b > self.args.black_level {
+                                re |= 0b1;
+                            };
+                        });
+                        re
+                    })
+                    .collect(),
+                8,
+            ),
         };
         let mut fout = std::fs::File::create(&self.args.output)?;
 
@@ -153,14 +179,22 @@ impl App {
             }
         }
 
-        self.write_const(&mut fout, "IMAGE_HEIGHT", image.height())?;
-        self.write_const(&mut fout, "IMAGE_WIDTH", image.width())?;
-        self.write_const(&mut fout, "PIXEL_SIZE", step as u32)?;
+        self.write_const(&mut fout, "IMAGE_HEIGHT", image.height() as usize)?;
+        self.write_const(&mut fout, "IMAGE_WIDTH", image.width() as usize)?;
+        self.write_const(&mut fout, "WIDTH_DELIMITER", width_del as usize)?;
+        self.write_const_type(
+            &mut fout,
+            "IMAGE_WIDTH_BYTES",
+            "IMAGE_WIDTH / WIDTH_DELIMITER",
+            "usize",
+        )?;
+
+        self.write_const(&mut fout, "PIXEL_SIZE", step)?;
         self.write_const_type(
             &mut fout,
             "IMAGE_LENGTH",
-            "IMAGE_WIDTH * IMAGE_HEIGHT * PIXEL_SIZE",
-            "u32",
+            "IMAGE_WIDTH_BYTES * IMAGE_HEIGHT * PIXEL_SIZE",
+            "usize",
         )?;
 
         match self.args.out_lang {
@@ -171,7 +205,7 @@ impl App {
             )?,
             OutLang::Rust => writeln!(
                 fout,
-                "const {}: [u8; IMAGE_LENGTH] = [",
+                "pub const {}: [u8; IMAGE_LENGTH] = [",
                 self.args.variable_name
             )?,
         }
@@ -181,9 +215,10 @@ impl App {
                 match self.args.output_view {
                     OutputPreview::Hex => write!(fout, "0x{:02x}, ", p)?,
                     OutputPreview::Dec => write!(fout, "{:3}, ", p)?,
+                    OutputPreview::Bin => write!(fout, "0b{:08b}, ", p)?,
                 }
             }
-            if (i > 0) && ((i + 1) as u32 % image.width() == 0) {
+            if (i > 0) && ((i + 1) as u32 % (image.width() / width_del) == 0) {
                 debug!("New line on index: {}", i);
                 writeln!(fout)?;
             }
@@ -222,7 +257,7 @@ impl App {
     fn write_const<V: Display>(
         &self,
         fout: &mut std::fs::File,
-        name: &'static str,
+        name: &str,
         value: V,
     ) -> anyhow::Result<()> {
         self.write_const_type(fout, name, value, std::any::type_name::<V>())
@@ -231,16 +266,16 @@ impl App {
     fn write_const_type<V: Display>(
         &self,
         fout: &mut std::fs::File,
-        name: &'static str,
+        name: &str,
         value: V,
-        tp: &'static str,
+        tp: &str,
     ) -> anyhow::Result<()> {
         match self.args.out_lang {
             OutLang::C => {
                 writeln!(fout, "#define {} {}", name, value)?;
             }
             OutLang::Rust => {
-                writeln!(fout, "const {}:{} = {};", name, tp, value)?;
+                writeln!(fout, "pub const {}:{} = {};", name, tp, value)?;
             }
         }
         Ok(())
