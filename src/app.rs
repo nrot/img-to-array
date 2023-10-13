@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use image::{imageops::FilterType, DynamicImage};
-use log::{debug, info};
-use std::{fmt::Display, io::Write, path::PathBuf};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, Pixel};
+use log::{debug, info, warn};
+use std::{ffi::OsStr, fmt::Display, io::Write, path::PathBuf};
 
 #[derive(Debug, Default, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum ColorType {
@@ -12,8 +12,14 @@ enum ColorType {
     /// 1 bytes per pixel
     #[default]
     Gray8,
+    /// Decoded
+    WBZip,
     /// 1 bit per pixel
     WB1,
+    ///
+    SSD1306,
+    ///
+    GCode,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -60,6 +66,7 @@ enum OutputPreview {
     #[default]
     Hex,
     Dec,
+    SDec,
     Bin,
 }
 
@@ -68,6 +75,14 @@ enum OutLang {
     #[default]
     C,
     Rust,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+enum Ending {
+    /// Litle ending
+    #[default]
+    Le,
+    Be,
 }
 
 #[derive(Parser, Debug)]
@@ -84,19 +99,19 @@ struct Arg {
     resize: Option<ResizeType>,
     #[arg(long, default_value = "hex")]
     output_view: OutputPreview,
-    #[arg(long, default_value = "__IMAGE", help = "define protect for C header")]
+    #[arg(long, help = "define protect for C header")]
     protect: Option<String>,
 
-    #[arg(long, default_value = "<cstdint>", help = "Include libs for C header")]
+    #[arg(long, default_value = "<stdint.h>", help = "Include libs for C header")]
     include_c: Vec<String>,
 
     #[arg(long, default_value = "c")]
     out_lang: OutLang,
 
-    #[arg(long, default_value = "IMAGE", help = "Name of const variable")]
-    variable_name: String,
+    #[arg(long, short, help = "Name of const variable")]
+    name_variable: Option<String>,
 
-    #[arg(long, default_value = "false", help = "Inverse colors")]
+    #[arg(long, short, default_value = "false", help = "Inverse colors")]
     inverse_color: bool,
 
     #[arg(long, help = "Blur image")]
@@ -104,6 +119,9 @@ struct Arg {
 
     #[arg(long, help = "Black level for wb1 out-color.", default_value = "128")]
     black_level: u8,
+
+    #[arg(long, help = "Ending out pixel", default_value = "le")]
+    ending: Ending,
 }
 
 pub struct App {
@@ -120,6 +138,19 @@ impl App {
 
     pub fn work(&mut self) -> anyhow::Result<()> {
         let mut image = image::open(&self.args.input)?;
+        let image_name = self.args.name_variable.clone().unwrap_or_else(|| {
+            self.args
+                .input
+                .file_name()
+                .unwrap_or_else(|| OsStr::new("IMAGE"))
+                .to_str()
+                .unwrap_or_else(|| "IMAGE")
+                .to_uppercase()
+                .replace('-', "_")
+                .split('.')
+                .take(1)
+                .collect()
+        });
 
         if self.args.inverse_color {
             image.invert();
@@ -133,7 +164,8 @@ impl App {
         if let Some(ni) = self.resize(&image) {
             image = ni;
         }
-        let (step, img_buffer, width_del) = match self.args.out_color {
+        let (step, mut img_buffer, width_del) = match self.args.out_color {
+            ColorType::GCode => (1usize, image.to_luma8().into_vec(), 1),
             ColorType::Rgb8 => (3usize, image.to_rgb8().into_vec(), 1),
             ColorType::Rgb16 => (
                 3 * 2,
@@ -146,7 +178,16 @@ impl App {
                 1,
             ),
             ColorType::Gray8 => (1, image.to_luma8().into_vec(), 1),
-            ColorType::WB1 => (
+            ColorType::WBZip => (
+                1,
+                image
+                    .to_luma8()
+                    .into_iter()
+                    .map(|v| if *v > self.args.black_level { 255 } else { 0 })
+                    .collect(),
+                1,
+            ),
+            ColorType::WB1 | ColorType::SSD1306 => (
                 1,
                 image
                     .to_luma8()
@@ -165,73 +206,180 @@ impl App {
                     .collect(),
                 8,
             ),
+            // ColorType::SSD1306 => (1, image.to_luma8().into_vec(), 8),
         };
         let mut fout = std::fs::File::create(&self.args.output)?;
 
         if self.args.out_lang == OutLang::C {
-            if let Some(p) = &self.args.protect {
-                writeln!(fout, "#ifndef {}", p)?;
-                writeln!(fout, "#define {}\n", p)?;
-            }
+            let p = self.args.protect.as_ref().unwrap_or_else(|| &image_name);
+            writeln!(fout, "#ifndef __{}", p)?;
+            writeln!(fout, "#define __{}\n", p)?;
 
             for include in &self.args.include_c {
                 writeln!(fout, "#include {}", include)?;
             }
         }
 
-        self.write_const(&mut fout, "IMAGE_HEIGHT", image.height() as usize)?;
-        self.write_const(&mut fout, "IMAGE_WIDTH", image.width() as usize)?;
-        self.write_const(&mut fout, "WIDTH_DELIMITER", width_del as usize)?;
+        self.write_const(
+            &mut fout,
+            &format!("{}_HEIGHT", image_name),
+            image.height() as usize,
+        )?;
+        self.write_const(
+            &mut fout,
+            &format!("{}_WIDTH", image_name),
+            image.width() as usize,
+        )?;
+        self.write_const(
+            &mut fout,
+            &format!("{}_WIDTH_DELIMITER", image_name),
+            width_del as usize,
+        )?;
         self.write_const_type(
             &mut fout,
-            "IMAGE_WIDTH_BYTES",
-            "IMAGE_WIDTH / WIDTH_DELIMITER",
+            &format!("{}_WIDTH_BYTES", image_name),
+            &format!("{0}_WIDTH / {0}_WIDTH_DELIMITER", image_name),
             "usize",
         )?;
 
-        self.write_const(&mut fout, "PIXEL_SIZE", step)?;
+        self.write_const(&mut fout, &format!("{}_PIXEL_SIZE", image_name), step)?;
+        let image_length =
+            image.width() as f32 * image.height() as f32 * step as f32 / width_del as f32;
+        let image_lenght = if image_length - image_length.floor() > 0.0 {
+            format!(
+                "{0}_HEIGHT * {0}_PIXEL_SIZE * {0}_WIDTH_BYTES + 1",
+                image_name
+            )
+        } else {
+            format!("{0}_HEIGHT * {0}_PIXEL_SIZE * {0}_WIDTH_BYTES", image_name)
+        };
         self.write_const_type(
             &mut fout,
-            "IMAGE_LENGTH",
-            "IMAGE_WIDTH_BYTES * IMAGE_HEIGHT * PIXEL_SIZE",
+            &format!("{}_LENGTH", image_name),
+            &image_lenght,
             "usize",
         )?;
 
-        match self.args.out_lang {
-            OutLang::C => writeln!(
-                fout,
-                "uint8_t {}[IMAGE_LENGTH] = {{",
-                self.args.variable_name
-            )?,
-            OutLang::Rust => writeln!(
-                fout,
-                "pub const {}: [u8; IMAGE_LENGTH] = [",
-                self.args.variable_name
-            )?,
+        match self.args.out_color {
+            ColorType::WBZip => {}
+            _ => match self.args.out_lang {
+                OutLang::C => writeln!(fout, "uint8_t {}[{}_LENGTH] = {{", image_name, image_name)?,
+                OutLang::Rust => writeln!(
+                    fout,
+                    "pub const {}: [u8; {}_LENGTH] = [",
+                    image_name, image_name
+                )?,
+            },
         }
 
-        for (i, p) in img_buffer.chunks(step).enumerate() {
-            for p in p {
-                match self.args.output_view {
-                    OutputPreview::Hex => write!(fout, "0x{:02x}, ", p)?,
-                    OutputPreview::Dec => write!(fout, "{:3}, ", p)?,
-                    OutputPreview::Bin => write!(fout, "0b{:08b}, ", p)?,
+        match self.args.out_color {
+            ColorType::WBZip => {
+                let mut buff = Vec::new();
+                let mut color = image.get_pixel(0, 0).to_luma().0[0] > self.args.black_level;
+                let mut color_s = 0u8;
+                let mut first = true;
+                for y in 0..image.height() {
+                    for x in 0..image.width() {
+                        let c = image.get_pixel(x, y).to_luma().0[0] > self.args.black_level;
+                        if color != c || color_s == 127 {
+                            buff.push(if color {
+                                0b10000000 | color_s
+                            } else {
+                                color_s
+                            });
+                            color = c;
+                            color_s = 0;
+                        } else {
+                            if first{
+                                first = false;
+                            } else {
+                                color_s += 1;
+                            }
+                        }
+                    }
+                    // buff.push(if color.to_luma().0[0] > self.args.black_level  {
+                    //     0b10000000 | color_s
+                    // } else {
+                    //     color_s
+                    // });
+                    // color = image.get_pixel(0, (y + 1) % image.height());
+                    // color_s = 0;
+                }
+                let len = buff.len() as u16;
+                buff.insert(0, len.to_le_bytes()[0]);
+                buff.insert(0, len.to_le_bytes()[1]);
+                match self.args.out_lang {
+                    OutLang::C => writeln!(fout, "uint8_t {}[{}] = {{", image_name, buff.len())?,
+                    OutLang::Rust => {
+                        writeln!(fout, "pub const {}: [u8; {}] = [", image_name, buff.len())?
+                    }
+                }
+                for p in &buff {
+                    match self.args.output_view {
+                        OutputPreview::Hex => write!(fout, "0x{:02x}, ", self.to_ending(p))?,
+                        OutputPreview::Dec => write!(fout, "{:3}, ", self.to_ending(p))?,
+                        OutputPreview::SDec => write!(fout, "{:3}, ", *p as u16 as i8)?,
+                        OutputPreview::Bin => write!(fout, "0b{:08b}, ", self.to_ending(p))?,
+                    }
                 }
             }
-            if (i > 0) && ((i + 1) as u32 % (image.width() / width_del) == 0) {
-                debug!("New line on index: {}", i);
-                writeln!(fout)?;
+            ColorType::SSD1306 => {
+                img_buffer.iter_mut().for_each(|v| {
+                    *v = !self.args.inverse_color as u8;
+                });
+                for irb in 0..((image.height() as f32 / 8.0).ceil() as u32) {
+                    for ic in 0..image.width() {
+                        for cc in 0..8 {
+                            if irb * 8 + cc >= image.height() {
+                                continue;
+                            }
+                            let p = image.get_pixel(ic, irb * 8 + cc).to_luma();
+                            if let Some(b) = img_buffer.get_mut((irb * image.width() + ic) as usize)
+                            {
+                                *b = *b & !(1 << cc)
+                                    | (((p.0[0] > self.args.black_level) as u8) << cc);
+                            } else {
+                                warn!(
+                                    "Outside image set pixel: {}, {}",
+                                    ic,
+                                    irb * image.width() + cc
+                                );
+                            };
+                        }
+                    }
+                }
+            }
+            ColorType::GCode=>{
+                for (i, p) in img_buffer.chunks(step).enumerate() {
+                    todo!("тут");
+                }
+            }
+            _ => {
+                for (i, p) in img_buffer.chunks(step).enumerate() {
+                    for p in p {
+                        match self.args.output_view {
+                            OutputPreview::Hex => write!(fout, "0x{:02x}, ", self.to_ending(p))?,
+                            OutputPreview::Dec => write!(fout, "{:3}, ", self.to_ending(p))?,
+                            OutputPreview::SDec => write!(fout, "{:3}, ", *p as u16 as i8)?,
+                            OutputPreview::Bin => write!(fout, "0b{:08b}, ", self.to_ending(p))?,
+                        }
+                    }
+                    if (i > 0) && ((i + 1) as u32 % (image.width() / width_del) == 0) {
+                        debug!("New line on index: {}", i);
+                        writeln!(fout)?;
+                    }
+                }
             }
         }
+
         match self.args.out_lang {
             OutLang::C => writeln!(fout, "}};")?,
             OutLang::Rust => writeln!(fout, "];")?,
         }
 
         if self.args.out_lang == OutLang::C {
-            if let Some(p) = &self.args.protect {
-                writeln!(fout, "#endif //{}", p)?;
-            }
+            let p = self.args.protect.as_ref().unwrap_or_else(|| &image_name);
+            writeln!(fout, "#endif //__{}", p)?;
         }
 
         fout.sync_data()?;
@@ -279,5 +427,37 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn to_ending<T: ToOrder>(&self, v: &T) -> u8 {
+        match self.args.ending {
+            Ending::Le => v.le(),
+            Ending::Be => v.be(),
+        }
+    }
+}
+
+trait ToOrder {
+    fn le(&self) -> u8;
+    fn be(&self) -> u8;
+}
+
+impl ToOrder for u8 {
+    fn le(&self) -> u8 {
+        self.to_le()
+    }
+
+    fn be(&self) -> u8 {
+        self.to_be()
+    }
+}
+
+impl ToOrder for i8 {
+    fn le(&self) -> u8 {
+        self.to_le() as u8
+    }
+
+    fn be(&self) -> u8 {
+        self.to_be() as u8
     }
 }
